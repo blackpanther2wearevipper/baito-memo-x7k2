@@ -49,14 +49,14 @@ ol{padding-left:20px;margin:6px 0}
 .seg{display:flex;border:1.5px solid var(--bd);border-radius:12px;overflow:hidden;margin:8px 0}
 .seg button{flex:1;min-height:44px;border:0;background:var(--sf);color:var(--tx2);font:inherit;font-weight:600}
 .seg button[aria-pressed=true]{background:var(--pr);color:var(--onpr)}
-.cal{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;margin:8px 0}
+.cal{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:2px;margin:8px 0}
 .cal .wh{text-align:center;font-size:12px;color:var(--tx2);padding:4px 0}
-.cell{min-height:68px;padding:3px 2px;border:1px solid var(--bd);border-radius:8px;background:var(--sf);color:var(--tx);font:inherit;display:flex;flex-direction:column;align-items:stretch;gap:2px;cursor:pointer;text-align:left;overflow:hidden;min-width:0}
+.cell{min-height:68px;padding:3px 2px;border:1px solid var(--bd);border-radius:8px;background:var(--sf);color:var(--tx);font:inherit;display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;gap:2px;cursor:pointer;text-align:left;min-width:0}
 .cell.out{opacity:.45}.cell.sel{outline:3px solid var(--pr);outline-offset:-1px}
 .cell .dn{font-size:12px;font-weight:600;padding-left:2px}.cell.td .dn{font-weight:800;text-decoration:underline}
-.chip{display:block;height:15px;line-height:11px;font-size:10px;font-style:normal;border:2px solid var(--k);border-radius:4px;padding:0 2px;white-space:nowrap;overflow:hidden;color:var(--tx)}
+.chip{display:block;font-size:10px;line-height:1.25;font-style:normal;border:2px solid var(--k);border-radius:4px;padding:1px 2px;color:var(--tx);overflow-wrap:anywhere;word-break:break-all}
+.chip b{display:block;font-weight:700}
 .chip.w{background:var(--k);color:#1B2433}
-.more{font-size:10px;color:var(--tx2);padding-left:2px}
 </style>
 </head>
 <body>
@@ -469,21 +469,22 @@ function homeView(R){
 }
 function calHtml(m){
  const today=todayStr(),cells=monthGrid(m),by={};
+ const hm=x=>pad(Math.floor(todOf(x)/60))+':'+pad(todOf(x)%60);
  for(const s of S.shifts){if(s.status==='cancelled'||!wpOf(s.wpId))continue;(by[s.date]=by[s.date]||[]).push(s)}
  const sel=UI.day||(today.slice(0,7)===m?today:'');
  let h='<div class="cal">'+[...WD].map(c=>'<div class="wh">'+c+'</div>').join('');
  for(const d of cells){
   const list=(by[d]||[]).slice().sort(byStart),inM=d.slice(0,7)===m;
   const nP=list.filter(s=>s.status==='planned').length,nW=list.length-nP;
-  const chips=list.slice(0,2).map(s=>{
-   const wp=wpOf(s.wpId),t=times(s);
-   return'<i class="chip'+(s.status==='worked'?' w':'')+'" style="--k:'+COLORS[wp.color]+'" aria-hidden="true">'+esc((wp.name||'?')[0])+Math.floor(todOf(t.st)/60)+'</i>';
+  const chips=list.map(s=>{
+   const wp=wpOf(s.wpId),t=times(s),nx=dayOf(t.en-1)>dayOf(t.st);
+   return'<i class="chip'+(s.status==='worked'?' w':'')+'" style="--k:'+COLORS[wp.color]+'" aria-hidden="true"><b>'+esc(wp.name)+'</b>'+hm(t.st)+'–<wbr>'+(nx?'翌':'')+hm(t.en)+'</i>';
   }).join('');
   const label=fmtD(d)+(d===today?' 今日':'')+(nW?' 実績'+nW+'件':'')+(nP?' 予定'+nP+'件':'')+(list.length?'':' シフトなし');
   h+='<button class="cell'+(inM?'':' out')+(d===sel?' sel':'')+(d===today?' td':'')+'" data-a="day" data-date="'+d+'" aria-label="'+label+'"'+(d===sel?' aria-current="date"':'')+'>'+
-   '<span class="dn">'+(+d.slice(8))+'</span>'+chips+(list.length>2?'<span class="more">+'+(list.length-2)+'</span>':'')+'</button>';
+   '<span class="dn">'+(+d.slice(8))+'</span>'+chips+'</button>';
  }
- return h+'</div><div class="sm">塗りつぶし=実績、枠だけ=予定。文字は勤務先の頭文字と開始時刻。</div>';
+ return h+'</div><div class="sm">塗りつぶし=実績、枠だけ=予定。勤務先名と開始–終了時刻を表示します(「翌」は翌日の終了)。画面が狭いと折り返します。</div>';
 }
 function dayPanel(R,d){
  const list=S.shifts.filter(s=>s.date===d).sort(byStart);
