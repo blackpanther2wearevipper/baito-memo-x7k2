@@ -57,12 +57,20 @@ ol{padding-left:20px;margin:6px 0}
 .chip{display:block;font-size:10px;line-height:1.25;font-style:normal;border:2px solid var(--k);border-radius:4px;padding:1px 2px;color:var(--tx);overflow-wrap:anywhere;word-break:break-all}
 .chip b{display:block;font-weight:700}
 .chip.w{background:var(--k);color:#1B2433}
+.ch-ax{stroke:var(--bd);stroke-width:1}
+.ch-ln{fill:none;stroke:var(--pr);stroke-width:3;stroke-linejoin:round}
+.ch-pj{fill:none;stroke:var(--pr);stroke-width:3;stroke-dasharray:7 5;stroke-linejoin:round}
+.ch-w{stroke:var(--war);stroke-width:1.5;stroke-dasharray:2 3}
+.ch-dot{fill:var(--pr);stroke:var(--sf);stroke-width:2}
+svg text{fill:var(--tx2);font-size:10px}
+svg text.ch-t{fill:var(--tx);paint-order:stroke;stroke:var(--sf);stroke-width:3px;stroke-linejoin:round}
 </style>
 </head>
 <body>
 <div id="app"></div>
 <script>
 'use strict';
+const VER='0.4(給与明細・年末見込み)';
 /* ================= 基本ユーティリティ ================= */
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -131,7 +139,13 @@ function sanitize(j){
   status:['planned','worked','cancelled'].includes(s.status)?s.status:'planned',
   breakMode:['auto','none','manual'].includes(s.breakMode)?s.breakMode:'auto',breakMin:Math.max(0,Math.round(num(s.breakMin,0))),
   aStart:T.test(s.aStart||'')?s.aStart.slice(0,5):'',aEnd:T.test(s.aEnd||'')?s.aEnd.slice(0,5):''}));
- return{v:1,wps:wps,shifts:shifts,walls:migrateWalls(j.walls,j.wallsVer),wallsVer:2,
+ const slips=(Array.isArray(j.slips)?j.slips:[]).filter(x=>x&&typeof x.id==='string'&&ids.has(x.wpId)&&D.test(x.pay||'')&&num(x.gross,0)>0).map(x=>{
+  const g=Math.round(+x.gross),c=Math.min(g,Math.max(0,Math.round(num(x.commute,0)))),pm=num(x.prem,null),nt=num(x.net,null);
+  return{id:x.id,wpId:x.wpId,pay:x.pay,gross:g,commute:c,prem:pm==null?null:Math.min(g-c,Math.max(0,Math.round(pm))),
+   net:nt==null?null:Math.max(0,Math.round(nt)),memo:String(x.memo||'').slice(0,100)}});
+ const pj=j.proj||{};
+ return{v:1,wps:wps,shifts:shifts,slips:slips,walls:migrateWalls(j.walls,j.wallsVer),wallsVer:2,
+  proj:{mode:['recent','registered','manual'].includes(pj.mode)?pj.mode:'recent',manual:Math.max(0,Math.round(num(pj.manual,0)))},
   last:ids.has(j.last)?j.last:'',lastBackup:D.test(j.lastBackup||'')?j.lastBackup:'',chg:Math.max(0,Math.round(num(j.chg,0))),hideIos:!!j.hideIos};
 }
 function load(){try{const j=JSON.parse(localStorage.getItem(KEY));if(j&&j.v===1)return sanitize(j)}catch(e){}return sanitize({v:1})}
@@ -201,23 +215,50 @@ function wallStatus(v,t,incl){
 }
 const wallPercent=(v,t)=>Math.floor(Math.max(0,v)*100/t);
 const pctLabel=p=>p>=200?'200%以上':p+'%';
-function wallValue(w,R,shifts,today,wpId){
- const y=today.slice(0,4),it=[];
+
+// 壁ごとの「金額の明細」: シフトの見込み。給与明細があれば実額に置き換える
+function wallItems(w,R,shifts,wpId){
+ const val=(g,c,p)=>Math.max(0,w.noPrem?g-c-p:g-(w.commute?0:c));
+ const gs=new Map();
  for(const s of shifts){
   if(wpId&&s.wpId!==wpId)continue;
   const r=R[s.id];if(!r||r.gross==null||s.status==='cancelled')continue;
   const wp=wpOf(s.wpId);if(!wp)continue;
-  it.push({d:s.date,pay:payDateFor(s.date,wp.closing,wp.payDay,wp.offset),amt:w.noPrem?r.base:r.gross-(w.commute?0:r.commute)});
+  const pay=payDateFor(s.date,wp.closing,wp.payDay,wp.offset),k=s.wpId+'|'+pay.slice(0,7);
+  const p=(r.nPay||0)+(r.oPay||0)+(r.hPay||0);
+  let g=gs.get(k);if(!g){g={its:[],est:0,ep:0};gs.set(k,g)}
+  const a=val(r.gross,r.commute,p);
+  g.its.push({d:s.date,pay:pay,amt:a,fix:false});g.est+=a;g.ep+=p;
  }
+ const out=[];
+ for(const sl of S.slips){
+  if(wpId&&sl.wpId!==wpId)continue;
+  const g=gs.get(sl.wpId+'|'+sl.pay.slice(0,7));
+  const a=val(sl.gross,sl.commute,sl.prem==null?(g?g.ep:0):sl.prem);
+  if(g&&g.est>0){const f=a/g.est;for(const i of g.its){i.amt*=f;i.pay=sl.pay;i.fix=true}}
+  else out.push({d:addDays(sl.pay,-20),pay:sl.pay,amt:a,fix:true}); // 勤務日が不明な明細は支給日の約20日前として扱う
+ }
+ for(const g of gs.values())for(const i of g.its)out.push(i);
+ return out;
+}
+// 直近のペース(最大90日、データが少ないときは実際の期間。最小28日)
+function paceOf(it,today){
+ const back=addDays(today,-90),td=dayOfDate(today);let past=0,first=null;
+ for(const i of it)if(i.d>=back&&i.d<today){past+=i.amt;if(!first||i.d<first)first=i.d}
+ const span=first?Math.min(90,Math.max(28,td-dayOfDate(first))):90;
+ return{past:past,span:span,perDay:past/span};
+}
+function wallValue(w,R,shifts,today,wpId){
+ const y=today.slice(0,4),it=wallItems(w,R,shifts,wpId);
  if(w.basis==='cal'){
-  let v=0,paid=0;
-  for(const i of it)if(i.pay.slice(0,4)===y){v+=i.amt;if(i.pay<=today)paid+=i.amt}
-  return{v:v,paid:paid,sched:v-paid};
+  let v=0,paid=0,fixed=0;
+  for(const i of it)if(i.pay.slice(0,4)===y){v+=i.amt;if(i.pay<=today)paid+=i.amt;if(i.fix)fixed+=i.amt}
+  return{v:v,paid:paid,sched:v-paid,fixed:fixed};
  }
- const end=addDays(today,365),back=addDays(today,-90);let reg=0,past=0;
- for(const i of it){if(i.d>=today&&i.d<end)reg+=i.amt;else if(i.d>=back&&i.d<today)past+=i.amt}
- const pace=past/90*365;
- return{v:Math.max(reg,pace),reg:reg,pace:pace};
+ const end=addDays(today,365),back=addDays(today,-90);let reg=0,fixed=0;
+ for(const i of it){if(i.d>=today&&i.d<end)reg+=i.amt;else if(i.d>=back&&i.d<today&&i.fix)fixed+=i.amt}
+ const pc=paceOf(it,today),pace=pc.perDay*365;
+ return{v:Math.max(reg,pace),reg:reg,pace:pace,span:pc.span,fixed:fixed};
 }
 function wallList(R,shifts,today){
  const out=[];
@@ -249,7 +290,7 @@ function wallCard(x,R){
  const avg=avgWage(R,S.shifts);
  const extra=w.basis==='cal'
   ?'<div class="sm">支払済み '+yen(x.paid)+' / 支払予定 '+yen(x.sched)+'</div>'
-  :'<div class="sm">登録済みの予定 '+yen(x.reg)+' / 直近90日のペース '+yen(x.pace)+'(大きいほうを採用)</div>';
+  :'<div class="sm">登録済みの予定 '+yen(x.reg)+' / 直近'+x.span+'日のペースを1年に換算 '+yen(x.pace)+'(大きいほうを採用)</div>';
  return'<div class="card wall s-'+s+(s==='safe'?'':' t')+'">'+
   '<div class="row sp"><b>'+esc(w.name)+'</b><span class="pill">'+ST[s][1]+' '+ST[s][0]+'</span></div>'+
   '<div class="sm">'+esc(w.cat||'その他')+(x.wp?' ・ '+esc(x.wp.name):'')+' ・ '+(w.basis==='cal'?'暦年(支払日ベース)':'今後1年の見込み')+'・交通費を'+(w.commute?'含む':'除く')+(w.noPrem?'・割増を除く':'')+
@@ -257,7 +298,148 @@ function wallCard(x,R){
   '<div class="row sp"><span class="amt">'+yen(x.v)+'</span><b>'+pctLabel(p)+'</b></div>'+
   '<div class="bar"><div class="fill'+(s==='danger'?' hatch':'')+'" style="width:'+fill+'%"></div><i class="tick" style="left:80%"></i><i class="tick" style="left:90%"></i></div>'+
   '<div>'+esc(footerText(x,avg))+'</div>'+extra+
+  (x.fixed>0?'<div class="sm">給与明細の実額を反映: '+yen(x.fixed)+'</div>':'')+
   (w.note?'<details><summary class="sm">この壁について</summary><div class="mut">'+esc(w.note)+'</div></details>':'')+'</div>';
+}
+
+/* ================= 年末までの見込み(このままいくと) ================= */
+function projectYear(R,shifts,today,mode,manual){
+ const y=today.slice(0,4),cur=+today.slice(5,7)-1;
+ const it=wallItems({basis:'cal',commute:false,noPrem:false},R,shifts,null);
+ const fx=new Array(12).fill(0);
+ for(const i of it)if(i.pay.slice(0,4)===y)fx[+i.pay.slice(5,7)-1]+=i.amt;
+ const pc=paceOf(it,today),recent=pc.perDay*30.4375;
+ const pace=mode==='manual'?Math.max(0,+manual||0):mode==='registered'?0:recent;
+ const cumF=[],cumP=[];let a=0,b=0;
+ for(let m=0;m<12;m++){a+=fx[m];b+=(m<=cur?fx[m]:Math.max(fx[m],pace));cumF.push(a);cumP.push(b)}
+ return{cumF:cumF,cumP:cumP,cur:cur,pace:pace,recent:recent,past:pc.past,span:pc.span,year:y};
+}
+function crossMonth(cum,t,incl){for(let m=0;m<12;m++)if(incl?cum[m]>=t:cum[m]>t)return m;return-1}
+function crossText(w,P){
+ const f=crossMonth(P.cumF,w.amount,w.incl),p=crossMonth(P.cumP,w.amount,w.incl);
+ if(f>=0&&f<=P.cur)return['now','■ すでに超過('+(f+1)+'月の支払い分で到達)'];
+ if(f>=0)return['reg','▲ '+(f+1)+'月の支払い分で超える(登録済みの予定だけで)'];
+ if(p>=0)return['pace','▲ このペースだと '+(p+1)+'月ごろに超える見込み'];
+ return['ok','✔ 年内は届かない見込み(年末で'+pctLabel(wallPercent(P.cumP[11],w.amount))+')'];
+}
+function chartSvg(P,ws){
+ const W=320,H=200,L=44,Rt=10,T=12,Bm=26,pw=W-L-Rt,ph=H-T-Bm,end=P.cumP[11];
+ const up=ws.map(w=>w.amount).filter(a=>a>end);
+ let ymax=Math.max(end,up.length?Math.min.apply(null,up):0)*1.08;if(!(ymax>0))ymax=1000000;
+ const X=m=>(L+pw*m/11).toFixed(1),Y=v=>(T+ph*(1-Math.min(v,ymax)/ymax)).toFixed(1);
+ const pts=(a,b)=>{const r=[];for(let m=a;m<=b;m++)r.push(X(m)+','+Y(P.cumP[m]));return r.join(' ')};
+ let h='<svg viewBox="0 0 '+W+' '+H+'" width="100%" role="img" aria-label="'+esc(P.year+'年の累計の見込み。現在 '+yen(P.cumP[P.cur])+'、年末 '+yen(end))+'">';
+ h+='<line class="ch-ax" x1="'+L+'" y1="'+Y(0)+'" x2="'+(W-Rt)+'" y2="'+Y(0)+'"/><text x="'+(L-4)+'" y="'+(+Y(0)+3)+'" text-anchor="end">0</text>';
+ let last=-99;
+ for(const w of ws.filter(w=>w.amount<=ymax).sort((a,b)=>b.amount-a.amount)){
+  const y=+Y(w.amount);let ty=Math.max(y-3,T+8);if(ty<last+11)ty=last+11;last=ty;
+  h+='<line class="ch-w" x1="'+L+'" y1="'+y+'" x2="'+(W-Rt)+'" y2="'+y+'"/><text class="ch-t" x="'+(L+3)+'" y="'+ty+'">'+(Math.round(w.amount/1000)/10)+'万円</text>';
+ }
+ for(let m=0;m<12;m++)if(m%3===0||m===11)h+='<text x="'+X(m)+'" y="'+(H-8)+'" text-anchor="middle">'+(m+1)+'月</text>';
+ h+='<polyline class="ch-ln" points="'+pts(0,P.cur)+'"/><polyline class="ch-pj" points="'+pts(P.cur,11)+'"/>';
+ h+='<circle class="ch-dot" r="4.5" cx="'+X(P.cur)+'" cy="'+Y(P.cumP[P.cur])+'"/></svg>';
+ return h;
+}
+function projCard(R){
+ const today=todayStr(),pr=S.proj,P=projectYear(R,S.shifts,today,pr.mode,pr.manual);
+ const cw=S.walls.filter(w=>w.on!==false&&w.basis==='cal'&&w.scope!=='wp').sort((a,b)=>a.amount-b.amount);
+ const note=pr.mode==='registered'?'今後シフトが増えない場合(登録済みの分だけ)':pr.mode==='manual'?'今後は毎月 '+yen(P.pace)+' と想定':'直近'+P.span+'日の勤務から、月 '+yen(P.pace)+' と換算';
+ return'<h2>このままいくと</h2><div class="card">'+
+  chartSvg(P,cw)+
+  '<div class="sm">実線=現在まで、点線=今後の想定、横の点線=壁。横軸は支払月。</div>'+
+  '<div class="line" style="margin-top:8px"><span>'+P.year+'年末の累計(見込み)</span><span class="amt">'+yen(P.cumP[11])+'</span></div>'+
+  '<div class="sm">想定: '+esc(note)+'。支払日ベース・交通費を除く。給与明細を入力した月は実額を使います。</div>'+
+  (pr.mode==='recent'&&P.past===0?'<p class="err">直近の勤務データがないため、今後の増加を見込んでいません。下で想定を変えられます。</p>':'')+
+  '<label>今後の想定</label><select id="pm">'+opt('recent','直近の勤務から換算',pr.mode)+opt('registered','登録済みだけ(これ以上増えない)',pr.mode)+opt('manual','月の金額を入力',pr.mode)+'</select>'+
+  (pr.mode==='manual'?'<label>月の想定収入(円)</label><input id="pmv" type="number" inputmode="numeric" value="'+pr.manual+'">':'')+
+  (cw.length?'<hr>'+cw.map(w=>{const c=crossText(w,P);return'<div style="margin-top:6px"><b>'+esc(w.name)+'</b><div class="mut">'+esc(c[1])+'</div></div>'}).join(''):'')+
+  '<div class="sm" style="margin-top:8px">収入が急に増える・減る予定は反映されません。目安としてご覧ください。</div></div>';
+}
+
+/* ================= 給与明細 ================= */
+function estFor(wpId,ym,R){
+ const e={n:0,planned:0,gross:0,commute:0,base:0,nPay:0,oPay:0,hPay:0,from:'',to:''},wp=wpOf(wpId);
+ if(!wp)return e;
+ for(const s of S.shifts){
+  if(s.wpId!==wpId||s.status==='cancelled')continue;
+  const r=R[s.id];if(!r||r.gross==null)continue;
+  if(payDateFor(s.date,wp.closing,wp.payDay,wp.offset).slice(0,7)!==ym)continue;
+  e.n++;if(s.status!=='worked')e.planned++;
+  e.gross+=r.gross;e.commute+=r.commute;e.base+=r.base;e.nPay+=r.nPay;e.oPay+=r.oPay;e.hPay+=r.hPay;
+  if(!e.from||s.date<e.from)e.from=s.date;
+  if(s.date>e.to)e.to=s.date;
+ }
+ return e;
+}
+function suggestPay(wpId,R){
+ const gs=payGroups(R).filter(g=>g.pay<=todayStr()&&g.by.has(wpId)&&!g.by.get(wpId).slip);
+ return gs.length?gs[gs.length-1].pay:todayStr();
+}
+function newSlipForm(wpId,pay){return{isNew:true,id:uid(),wpId:wpId,pay:pay,gross:'',commute:'',prem:'',net:'',memo:''}}
+function readSlip(){const f=UI.slip;document.querySelectorAll('#sf [name]').forEach(el=>{f[el.name]=el.value})}
+function cmpHtml(){
+ const f=UI.slip,wp=wpOf(f.wpId),n=v=>(v===''||v==null)?null:Math.round(Number(v));
+ if(!wp||!/^\d{4}-\d\d-\d\d$/.test(f.pay||''))return'<p class="mut">勤務先と支給日を入力してください</p>';
+ const R=calcAll(S.shifts),e=estFor(f.wpId,f.pay.slice(0,7),R),g=n(f.gross);
+ const L=(a,b)=>'<div class="line"><span>'+a+'</span><span>'+b+'</span></div>';
+ if(!e.n)return'<p class="mut">'+f.pay.slice(0,7)+'に支払われるシフトが登録されていません。この明細は、実額のまま壁の集計に入ります。見込みと比べたいときは、シフトを登録するか、勤務先の締め日・支払日の設定を確認してください。</p>';
+ let h='<div class="sm">'+fmtD(e.from)+'–'+fmtD(e.to)+' の勤務分 '+e.n+'件</div>'+L('基本',yen(e.base))+(e.nPay?L('深夜割増',yen(e.nPay)):'')+(e.oPay?L('残業割増',yen(e.oPay)):'')+(e.hPay?L('休日割増',yen(e.hPay)):'')+(e.commute?L('交通費',yen(e.commute)):'')+
+  '<hr>'+L('<b>アプリの見込み</b>','<b>'+yen(e.gross)+'</b>');
+ if(e.planned)h+='<div class="sm">予定のままのシフトが'+e.planned+'件あります。実績にすると精度が上がります。</div>';
+ if(!(g>0))return h+'<p class="mut">総支給額を入力すると差が出ます</p>';
+ const d=g-e.gross;
+ h+=L('<b>明細の総支給額</b>','<b>'+yen(g)+'</b>');
+ if(d===0)h+='<p>✔ 一致しています</p>';
+ else{
+  h+='<p><b>差 '+(d>0?'+':'−')+yen(Math.abs(d))+'</b>(明細のほうが'+(d>0?'多い':'少ない')+')</p><div class="sm">考えられる原因:</div><ol class="sm">'+
+   (Math.abs(d)*50<=e.gross?'<li>分単位の切り捨て(15分・30分)や、1円未満の端数</li>':'')+
+   (d>0?'<li>登録していないシフトや、時間外の勤務</li><li>皆勤・役職などの手当</li><li>割増率や交通費の違い</li>'
+        :'<li>休憩の取り方(アプリは6時間超45分・8時間超60分を自動で引きます)</li><li>15分・30分単位の切り捨て</li><li>欠勤・遅刻の控除、予定のまま実際は短かった</li>')+'</ol>';
+ }
+ const c=n(f.commute);if(c!=null&&c!==e.commute)h+='<div class="sm">交通費: 明細 '+yen(c)+' / アプリ '+yen(e.commute)+'</div>';
+ return h;
+}
+function slipFormView(){
+ const f=UI.slip;
+ return head(f.isNew?'給与明細を入力':'給与明細を編集')+'<main><div id="sf">'+
+  '<div class="sm">明細にある「総支給額」(控除前の合計)を入力します。手取りではありません。</div>'+
+  '<label>勤務先</label><select name="wpId" data-rerender>'+S.wps.map(w=>opt(w.id,esc(w.name),f.wpId)).join('')+'</select>'+
+  '<label>支給日</label><input type="date" name="pay" value="'+esc(f.pay)+'">'+
+  '<label>総支給額(円)</label><input type="number" inputmode="numeric" name="gross" value="'+esc(f.gross)+'">'+
+  '<label>うち通勤手当・交通費(円・分かれば)</label><input type="number" inputmode="numeric" name="commute" value="'+esc(f.commute)+'">'+
+  '<label>うち深夜・残業・休日の割増(円・分かれば)</label><input type="number" inputmode="numeric" name="prem" value="'+esc(f.prem)+'">'+
+  '<div class="sm">空欄なら、割増はアプリの計算値を使います(106万円の目安にだけ影響します)。</div>'+
+  '<label>差引支給額=手取り(円・任意)</label><input type="number" inputmode="numeric" name="net" value="'+esc(f.net)+'">'+
+  '<label>メモ(任意)</label><input name="memo" value="'+esc(f.memo)+'">'+
+  '</div><h2>アプリの見込みとの比較</h2><div class="card" id="cmp" aria-live="polite">'+cmpHtml()+'</div>'+
+  '<div class="row" style="margin-top:16px"><button class="btn pri" style="flex:1" data-a="saveSlip">保存</button><button class="btn" data-a="cancelForm">戻る</button></div>'+
+  (f.isNew?'':'<button class="btn dng" style="width:100%;margin-top:16px" data-a="delSlip">この明細を削除</button>')+'</main>';
+}
+function saveSlip(){
+ readSlip();const f=UI.slip,n=v=>(v===''||v==null)?null:Math.round(Number(v));
+ const gross=n(f.gross),c=n(f.commute),p=n(f.prem),net=n(f.net);
+ if(!f.wpId||!wpOf(f.wpId)){alert('勤務先を選んでください');return}
+ if(!/^\d{4}-\d\d-\d\d$/.test(f.pay||'')){alert('支給日を入力してください');return}
+ if(!(gross>0)){alert('総支給額を入力してください');return}
+ if([c,p,net].some(x=>x!=null&&!(x>=0))){alert('マイナスや数字以外の入力があります');return}
+ if((c||0)+(p||0)>gross){alert('交通費と割増の合計が、総支給額を超えています');return}
+ const sl={id:f.id,wpId:f.wpId,pay:f.pay,gross:gross,commute:c||0,prem:p,net:net,memo:String(f.memo||'').trim().slice(0,100)};
+ const dup=S.slips.find(x=>x.wpId===sl.wpId&&x.pay.slice(0,7)===sl.pay.slice(0,7)&&x.id!==sl.id);
+ if(dup){
+  if(!confirm('同じ勤務先・同じ支給月の明細('+fmtD(dup.pay)+' '+yen(dup.gross)+')があります。置き換えますか?'))return;
+  S.slips=S.slips.filter(x=>x.id!==dup.id);
+ }
+ const i=S.slips.findIndex(x=>x.id===sl.id);if(i>=0)S.slips[i]=sl;else S.slips.push(sl);
+ save();UI.slip=null;render();
+}
+function slipRow(x,R){
+ const wp=wpOf(x.wpId);if(!wp)return'';
+ const e=estFor(x.wpId,x.pay.slice(0,7),R),d=e.n?x.gross-e.gross:null;
+ return'<div class="card shift" data-a="editSlip" data-id="'+x.id+'"><div class="row sp"><div class="row">'+dotHtml(wp)+'<b>'+esc(wp.name)+'</b></div><span class="tag">明細</span></div>'+
+  '<div class="mut">'+x.pay.slice(0,4)+'年 '+fmtD(x.pay)+' 支給</div>'+
+  '<div class="row sp"><span class="amt">'+yen(x.gross)+'</span>'+(x.net!=null?'<span class="mut">手取り '+yen(x.net)+'</span>':'')+'</div>'+
+  (d==null?'<div class="sm">対応するシフトがありません(明細の実額のみで集計)</div>':d===0?'<div class="sm">アプリの見込みと一致 ✔</div>':'<div class="sm">アプリの見込み '+yen(e.gross)+' との差 '+(d>0?'+':'−')+yen(Math.abs(d))+'</div>')+
+  (x.memo?'<div class="sm">'+esc(x.memo)+'</div>':'')+'</div>';
 }
 
 /* ================= カレンダー・Googleカレンダー ================= */
@@ -355,11 +537,11 @@ function applyImport(raw){
  let j;
  try{if(!raw||raw.v!==1||!Array.isArray(raw.wps)||!Array.isArray(raw.shifts))throw 0;j=sanitize(raw)}
  catch(e){alert('バックアップの形式が違います');return false}
- const msg='今のデータ(勤務先'+S.wps.length+'・シフト'+S.shifts.length+'件)を、次の内容で置き換えます。\n\n勤務先'+j.wps.length+'・シフト'+j.shifts.length+'件'+
+ const msg='今のデータ(勤務先'+S.wps.length+'・シフト'+S.shifts.length+'件・明細'+S.slips.length+'件)を、次の内容で置き換えます。\n\n勤務先'+j.wps.length+'・シフト'+j.shifts.length+'件・明細'+j.slips.length+'件'+
   (raw.exportedAt?'\n書き出し日: '+String(raw.exportedAt).slice(0,10):'')+'\n\nよろしいですか?(直前の状態は設定の「元に戻す」で復元できます)';
  if(!confirm(msg))return false;
  try{localStorage.setItem(KEY+'-prev',JSON.stringify(S))}catch(e){}
- S=j;UI.form=null;UI.wpForm=null;UI.code='';markBackup();render();return true;
+ S=j;UI.form=null;UI.wpForm=null;UI.slip=null;UI.code='';markBackup();render();return true;
 }
 function importFile(file){
  if(!file)return;const fr=new FileReader();
@@ -379,7 +561,7 @@ function copyCode(){
 }
 
 /* ================= 画面の状態 ================= */
-let UI={tab:'home',month:todayStr().slice(0,7),view:'cal',day:'',form:null,wpForm:null,test:null,code:''};
+let UI={tab:'home',month:todayStr().slice(0,7),view:'cal',day:'',form:null,wpForm:null,slip:null,test:null,code:''};
 const TABS=[['home','ホーム'],['shifts','シフト'],['pay','給料'],['wall','壁'],['set','設定']];
 const head=t=>'<header><h1>'+t+'</h1></header>';
 const nav=()=>'<nav>'+TABS.map(t=>'<button data-a="tab" data-t="'+t[0]+'" class="'+(UI.tab===t[0]?'on':'')+'">'+t[1]+'</button>').join('')+'</nav>';
@@ -390,8 +572,9 @@ function render(){
  const R=calcAll(S.shifts);let body;
  if(UI.form)body=formView();
  else if(UI.wpForm)body=wpFormView();
+ else if(UI.slip)body=slipFormView();
  else body=({home:homeView,shifts:shiftsView,pay:payView,wall:wallView,set:setView})[UI.tab](R);
- $('#app').innerHTML=body+(UI.form||UI.wpForm?'':nav());
+ $('#app').innerHTML=body+(UI.form||UI.wpForm||UI.slip?'':nav());
 }
 
 /* ---------- 共通の部品 ---------- */
@@ -412,21 +595,40 @@ function shiftCard(s,R,acts){
   '<div>'+amountHtml(s,r)+'</div>'+
   (acts&&s.status==='planned'?'<div class="row" style="margin-top:8px"><button class="btn pri" data-a="done" data-id="'+s.id+'">予定通り働いた ✓</button><button class="btn" data-a="edit" data-id="'+s.id+'">時間を修正</button></div>':'')+'</div>';
 }
+// 給料日ごとのまとめ。同じ勤務先・同じ支給月に給与明細があれば、明細の金額を使う
 function payGroups(R){
- const m=new Map();
+ const em=new Map();
  for(const s of S.shifts){
   const r=R[s.id];if(s.status==='cancelled'||!r||r.gross==null)continue;
   const wp=wpOf(s.wpId);if(!wp)continue;
-  const p=payDateFor(s.date,wp.closing,wp.payDay,wp.offset);
-  let g=m.get(p);if(!g){g={pay:p,gross:0,commute:0,all:true,by:new Map(),from:s.date,to:s.date};m.set(p,g)}
-  g.gross+=r.gross;g.commute+=r.commute;if(s.status!=='worked')g.all=false;
-  g.by.set(wp.id,(g.by.get(wp.id)||0)+r.gross);
-  if(s.date<g.from)g.from=s.date;if(s.date>g.to)g.to=s.date;
+  const p=payDateFor(s.date,wp.closing,wp.payDay,wp.offset),k=wp.id+'|'+p.slice(0,7);
+  let e=em.get(k);if(!e){e={wp:wp.id,pay:p,gross:0,commute:0,all:true,from:s.date,to:s.date,slip:null,est:0};em.set(k,e)}
+  e.gross+=r.gross;e.commute+=r.commute;e.est+=r.gross;if(s.status!=='worked')e.all=false;
+  if(s.date<e.from)e.from=s.date;
+  if(s.date>e.to)e.to=s.date;
+ }
+ for(const sl of S.slips){
+  if(!wpOf(sl.wpId))continue;
+  const k=sl.wpId+'|'+sl.pay.slice(0,7);let e=em.get(k);
+  if(!e){e={wp:sl.wpId,pay:sl.pay,est:0,from:'',to:''};em.set(k,e)}
+  e.gross=sl.gross;e.commute=sl.commute;e.pay=sl.pay;e.slip=sl;e.all=true;
+ }
+ const m=new Map();
+ for(const e of em.values()){
+  let g=m.get(e.pay);if(!g){g={pay:e.pay,gross:0,commute:0,all:true,by:new Map(),from:'',to:''};m.set(e.pay,g)}
+  g.gross+=e.gross;g.commute+=e.commute;if(!e.all)g.all=false;g.by.set(e.wp,e);
+  if(e.from&&(!g.from||e.from<g.from))g.from=e.from;
+  if(e.to&&e.to>g.to)g.to=e.to;
  }
  return[...m.values()].sort((a,b)=>a.pay<b.pay?-1:1);
 }
-function groupRows(g){
- return[...g.by.entries()].map(e=>{const wp=wpOf(e[0]);return'<div class="line"><span>'+dotHtml(wp)+' '+esc(wp.name)+'</span><span>'+yen(e[1])+'</span></div>'}).join('');
+function groupRows(g,today){
+ return[...g.by.values()].map(e=>{
+  const wp=wpOf(e.wp),diff=e.slip&&e.est>0?e.gross-e.est:null;
+  return'<div class="line"><span>'+dotHtml(wp)+' '+esc(wp.name)+(e.slip?' <span class="tag">明細</span>':'')+'</span><span>'+yen(e.gross)+'</span></div>'+
+   (!e.slip&&g.pay<=today?'<div style="text-align:right"><button class="btn sm" data-a="newSlip" data-wp="'+wp.id+'" data-pay="'+g.pay+'">明細を入力</button></div>':'')+
+   (diff!=null&&diff!==0?'<div class="sm" style="text-align:right">アプリの見込みとの差 '+(diff>0?'+':'−')+yen(Math.abs(diff))+'</div>':'');
+ }).join('');
 }
 function monthSum(m,R){
  let act=0,pl=0,cm=0;
@@ -448,6 +650,7 @@ function homeView(R){
  const mp=today.slice(0,7);let noWage=0;
  for(const s of S.shifts){if(s.date.slice(0,7)!==mp||s.status==='cancelled')continue;const r=R[s.id];if(!r||r.gross==null)noWage++}
  const sm=monthSum(mp,R);
+ const P=projectYear(R,S.shifts,today,S.proj.mode,S.proj.manual);
  const next=payGroups(R).find(g=>g.pay>=today);
  const up=S.shifts.filter(s=>s.date>today&&s.status==='planned').sort(byStart).slice(0,3);
  const bi=backupInfo();
@@ -456,6 +659,7 @@ function homeView(R){
   (isIosBrowser()&&!S.hideIos?'<div class="card s-warning wall t"><b>ホーム画面に追加してください</b><div class="mut">iPhoneのSafariは、約7日間サイトを使わないとデータを消すことがあります。共有ボタン →「ホーム画面に追加」で使うと避けられます。追加したアプリはデータが別なので、先にバックアップを保存し、アプリ側で読み込んでください。</div><button class="btn sm" data-a="hideIos">了解(表示しない)</button></div>':'')+
   '<h2>今日のシフト</h2>'+(ts.length?ts.map(s=>shiftCard(s,R,true)).join(''):'<div class="card mut">今日のシフトはありません</div>')+
   '<h2>壁チェック</h2>'+(top?wallCard(top,R)+'<div class="row">'+(over?'<span class="sm">超過済み '+over+'件</span>':'')+'<button class="btn sm" data-a="tab" data-t="wall">すべて見る</button></div>':'<div class="card mut">有効な壁がありません(設定で追加できます)</div>')+
+  '<div class="card mut">このままいくと、'+P.year+'年の累計(支払日ベース・交通費除く)は年末に約 <b>'+yen(P.cumP[11])+'</b> の見込みです。<div><button class="btn sm" data-a="tab" data-t="wall" style="margin-top:6px">グラフを見る</button></div></div>'+
   '<h2>今月の勤務分</h2><div class="card">'+
   '<div class="line"><span>実績</span><b>'+yen(sm.act)+'</b></div>'+
   (sm.pl>0?'<div class="line"><span>予定 <span class="tag">見込</span></span><b>'+yen(sm.pl)+'</b></div>':'')+
@@ -463,7 +667,7 @@ function homeView(R){
   (sm.cm>0?'<div class="sm" style="text-align:right">うち交通費 '+yen(sm.cm)+'</div>':'')+
   (noWage?'<div class="sm">時給が未設定のシフト'+noWage+'件は含まれていません</div>':'')+
   (next?'<hr><div class="line"><span>次の給料日 '+fmtD(next.pay)+'</span><b>'+yen(next.gross)+(next.all?'':' <span class="tag">見込</span>')+'</b></div>'+
-   '<div class="sm">'+fmtD(next.from)+'–'+fmtD(next.to)+' の勤務分'+(next.pay.slice(0,4)!==today.slice(0,4)?' ・'+next.pay.slice(0,4)+'年分に算入':'')+'</div>':'')+
+   (next.from?'<div class="sm">'+fmtD(next.from)+'–'+fmtD(next.to)+' の勤務分'+(next.pay.slice(0,4)!==today.slice(0,4)?' ・'+next.pay.slice(0,4)+'年分に算入':'')+'</div>':''):'')+
   '</div><h2>次のシフト</h2>'+(up.length?up.map(s=>shiftCard(s,R,false)).join(''):'<div class="card mut">予定はありません</div>')+
   '<button class="btn pri" style="width:100%;margin-top:12px" data-a="newShift">＋ シフトを追加</button></main>';
 }
@@ -511,20 +715,23 @@ function shiftsView(R){
   (list.length?list.map(s=>shiftCard(s,R,false)).join(''):'<div class="card mut">この月のシフトはありません</div>')+sumCard+'</main>';
 }
 function payView(R){
- const today=todayStr(),from=addDays(today,-62),gs=payGroups(R).filter(g=>g.pay>=from);
- const y=today.slice(0,4);let ytd=0;for(const g of payGroups(R))if(g.pay.slice(0,4)===y)ytd+=g.gross;
- return head('給料')+'<main><div class="card"><div class="line"><span>'+y+'年の支給額(支払日ベース)</span><b>'+yen(ytd)+'</b></div><div class="sm">交通費込みの総支給の目安です。実際の振込額は控除で少なくなります。</div></div>'+
+ const today=todayStr(),from=addDays(today,-62),all=payGroups(R),gs=all.filter(g=>g.pay>=from);
+ const y=today.slice(0,4);let ytd=0;for(const g of all)if(g.pay.slice(0,4)===y)ytd+=g.gross;
+ const sl=S.slips.slice().sort((a,b)=>a.pay<b.pay?1:-1);
+ return head('給料')+'<main><div class="card"><div class="line"><span>'+y+'年の支給額(支払日ベース)</span><b>'+yen(ytd)+'</b></div><div class="sm">交通費込みの総支給の目安です。給与明細を入力した月は実額です。実際の振込額は控除で少なくなります。</div></div>'+
+  '<button class="btn pri" style="width:100%" data-a="newSlip">＋ 給与明細を入力</button>'+
   (gs.length?gs.map(g=>'<div class="card"><div class="row sp"><b>'+fmtD(g.pay)+' 支払</b>'+(g.pay.slice(0,4)!==y?'<span class="tag">'+g.pay.slice(0,4)+'年分に算入</span>':'')+'</div>'+
-   '<div class="sm">'+fmtD(g.from)+'–'+fmtD(g.to)+' の勤務分</div>'+groupRows(g)+'<hr>'+
+   (g.from?'<div class="sm">'+fmtD(g.from)+'–'+fmtD(g.to)+' の勤務分</div>':'')+groupRows(g,today)+'<hr>'+
    '<div class="line"><span>合計 '+(g.all?'':'<span class="tag">見込</span>')+'</span><span class="amt">'+yen(g.gross)+'</span></div>'+
-   (g.commute>0?'<div class="sm" style="text-align:right">うち交通費 '+yen(g.commute)+'</div>':'')+'</div>').join(''):'<div class="card mut">表示できる給料日がありません</div>')+'</main>';
+   (g.commute>0?'<div class="sm" style="text-align:right">うち交通費 '+yen(g.commute)+'</div>':'')+'</div>').join(''):'<div class="card mut">表示できる給料日がありません</div>')+
+  '<h2>入力済みの給与明細</h2>'+(sl.length?sl.map(x=>slipRow(x,R)).join(''):'<div class="card mut">まだありません。明細を入力すると、壁の集計が実額になり、アプリの計算との差も分かります。シフトを登録していない月の明細も入力できます。</div>')+'</main>';
 }
 function wallView(R){
  const today=todayStr(),ws=wallList(R,S.shifts,today);
  const yr=wallValue({basis:'cal',commute:false},R,S.shifts,today),n12=wallValue({basis:'n12',commute:true},R,S.shifts,today);
  let h=head('壁チェック')+'<main>'+
   '<div class="card"><div class="line"><span>'+today.slice(0,4)+'年の収入(支払日ベース・交通費除く)</span><b>'+yen(yr.v)+'</b></div>'+
-  '<div class="line"><span>今後1年の見込み(交通費込み)</span><b>'+yen(n12.v)+'</b></div></div>';
+  '<div class="line"><span>今後1年の見込み(交通費込み)</span><b>'+yen(n12.v)+'</b></div></div>'+projCard(R);
  if(!ws.length)h+='<div class="card mut">有効な壁がありません。設定から追加できます。</div>';
  for(const c of CATS){
   const items=ws.filter(x=>(CATS.includes(x.w.cat)?x.w.cat:'その他')===c);
@@ -541,7 +748,7 @@ function setView(){
   '<h2>バックアップ</h2><div class="card">'+
   '<div class="line"><span>最後の保存</span><b>'+(S.lastBackup||'まだありません')+'</b></div>'+
   '<div class="line"><span>それ以降の変更</span><b>'+(S.chg||0)+'回</b></div>'+
-  '<div class="line"><span>データ</span><span>勤務先'+S.wps.length+' / シフト'+S.shifts.length+'件</span></div>'+
+  '<div class="line"><span>データ</span><span>勤務先'+S.wps.length+' / シフト'+S.shifts.length+'件 / 明細'+S.slips.length+'件</span></div>'+
   '<div class="sm">ブラウザの保護申請: '+(PERSIST===true?'許可(確実ではありません)':PERSIST===false?'許可されていません':'確認中')+'</div>'+
   (bi?'<p class="err">⚠ '+bi+'</p>':'')+
   '<button class="btn pri" style="width:100%;margin-top:8px" data-a="share">バックアップを保存する(共有)</button>'+
@@ -581,7 +788,7 @@ function setView(){
    '<button class="btn sm dng" style="margin-top:12px" data-a="delWall" data-i="'+i+'">この壁を削除</button></details>').join('')+'</div>'+
   '<div class="row"><button class="btn" data-a="addWall">＋ 壁を追加</button><button class="btn" data-a="resetWalls">初期値に戻す</button></div>'+
 
-  '<h2>動作確認</h2><div class="card"><button class="btn" data-a="test">自己テストを実行</button>'+
+  '<h2>動作確認</h2><div class="card"><div class="sm">バージョン '+VER+'</div><button class="btn" style="margin-top:8px" data-a="test">自己テストを実行</button>'+
   (t?'<p><b>'+(t.every(x=>x.ok)?'✔ すべて合格':'✘ 失敗があります')+'</b>('+t.filter(x=>x.ok).length+'/'+t.length+')</p>'+
    t.map(x=>'<div class="'+(x.ok?'mut':'err')+'">'+(x.ok?'✔ ':'✘ ')+esc(x.n)+(x.ok?'':' → '+esc(x.d))+'</div>').join(''):'')+'</div>'+
   '<h2>その他</h2><div class="card"><button class="btn dng" data-a="wipe">全データを削除</button><p class="sm">このアプリの計算は目安です。税・社会保険の判定の最終確認は、勤務先・健保組合・税務署などでお願いします。</p></div></main>';
@@ -686,7 +893,7 @@ function wpFormView(){
   '<label>法定休日の曜日</label><select name="holDow">'+opt('','なし',f.holDow)+[0,1,2,3,4,5,6].map(i=>opt(i,WD[i]+'曜',f.holDow)).join('')+'</select>'+
   '<label>交通費(1日あたり・円。0ならなし)</label><input type="number" inputmode="numeric" name="commute" value="'+esc(f.commute)+'">'+
   '</div><div class="row" style="margin-top:20px"><button class="btn pri" style="flex:1" data-a="saveWp">保存</button><button class="btn" data-a="cancelForm">戻る</button></div>'+
-  (f.isNew?'':'<button class="btn dng" style="width:100%;margin-top:16px" data-a="delWp">この勤務先とシフトを削除</button>')+'</main>';
+  (f.isNew?'':'<button class="btn dng" style="width:100%;margin-top:16px" data-a="delWp">この勤務先とシフト・明細を削除</button>')+'</main>';
 }
 function readWp(){
  const f=UI.wpForm,g=n=>document.querySelector('#w [name='+n+']');
@@ -715,6 +922,7 @@ function runTests(){
  const mk=o=>({...newWp(),wages:[{from:'2000-01-01',yen:1200}],...o});
  const sh=(d,s,e,o)=>({id:uid(),wpId:'t',date:d,start:s,end:e,status:'planned',breakMode:'auto',...o});
  const one=(wp,s)=>calcWp(wp,[s])[s.id];
+ const withS=(o,f)=>{const old=S;S=Object.assign({},old,o);try{return f()}finally{S=old}};
  T('夕方17:00–22:30・交通費400 = 7,150円',()=>{const r=one(mk({commute:400}),sh('2025-12-05','17:00','22:30'));return all(eq(r.gross,7150),eq(r.night,30),eq(r.work,330))});
  T('日またぎ22:00→7:00・自動休憩 = 11,400円',()=>{const r=one(mk(),sh('2025-12-05','22:00','07:00'));return all(eq(r.gross,11400),eq(r.work,480),eq(r.night,360))});
  T('1日8時間超の残業(9:00–19:00) = 11,100円',()=>{const r=one(mk(),sh('2025-12-05','09:00','19:00'));return all(eq(r.gross,11100),eq(r.ot,60))});
@@ -763,7 +971,43 @@ function runTests(){
    {id:'1',wpId:'a',date:'2025-12-05',start:'17:00',end:'22:00',status:'planned'},
    {id:'2',wpId:'zzz',date:'2025-12-05',start:'17:00',end:'22:00',status:'planned'},
    {id:'3',wpId:'a',date:'bad',start:'17:00',end:'22:00',status:'planned'}]});
-  return all(eq(j.shifts.length,1),eq(j.wps[0].nightPct,25),eq(j.walls.length,8))});
+  return all(eq(j.shifts.length,1),eq(j.wps[0].nightPct,25),eq(j.walls.length,8),eq(j.slips.length,0))});
+ /* --- 給与明細・見込み --- */
+ const wpT=mk({id:'t',commute:400}),sT=sh('2025-12-05','17:00','22:30'),RT=calcWp(wpT,[sT]);
+ const slip=o=>Object.assign({id:'sl',wpId:'t',pay:'2026-01-25',gross:10000,commute:400,prem:null,net:null,memo:''},o);
+ const sumAmt=its=>Math.round(its.reduce((a,i)=>a+i.amt,0));
+ T('明細: 同じ支給月のシフトは、明細の実額に置き換わる',()=>withS({wps:[wpT],slips:[slip({})]},()=>{
+  const its=wallItems({basis:'cal',commute:false,noPrem:false},RT,[sT],null);
+  return all(eq(its.length,1),eq(sumAmt(its),9600),eq(its[0].fix,true))}));
+ T('明細: 割増を除く壁では割増欄を使う(空ならアプリの割増)',()=>{
+  const w={basis:'cal',commute:false,noPrem:true};
+  const f=o=>withS({wps:[wpT],slips:[slip(o)]},()=>sumAmt(wallItems(w,RT,[sT],null)));
+  return all(eq(f({prem:1000}),8600),eq(f({prem:null}),9450))});
+ T('明細: シフトがない月は明細だけで集計される',()=>withS({wps:[wpT],slips:[slip({})]},()=>{
+  const its=wallItems({basis:'cal',commute:false,noPrem:false},{},[],null);
+  return all(eq(its.length,1),eq(its[0].amt,9600),eq(its[0].pay,'2026-01-25'),eq(its[0].d,'2026-01-05'))}));
+ T('明細: 見込みとの照合は支給月ごと',()=>withS({wps:[wpT],shifts:[sT]},()=>{
+  const e=estFor('t','2026-01',RT);return all(eq(e.n,1),eq(e.gross,7150),eq(e.commute,400),eq(estFor('t','2026-02',RT).n,0))}));
+ T('給料: 明細があれば明細の金額を使う',()=>withS({wps:[wpT],shifts:[sT],slips:[slip({})]},()=>{
+  const g=payGroups(RT);return all(eq(g.length,1),eq(g[0].gross,10000),eq(g[0].all,true))}));
+ T('ペース: 30日間で9,000円なら1日300円',()=>eq(paceOf([{d:'2026-05-16',amt:9000}],'2026-06-15').perDay,300));
+ T('見込み: 月の金額を入力すると年末まで伸びる',()=>withS({wps:[wpT],slips:[]},()=>{
+  const P=projectYear({},[],'2026-06-15','manual',200000);
+  return all(eq(P.cur,5),eq(P.cumP[5],0),eq(P.cumP[11],1200000),eq(P.cumF[11],0))}));
+ T('見込み: 登録済みだけなら増えない',()=>withS({wps:[wpT],slips:[slip({})]},()=>{
+  const P=projectYear({},[],'2026-06-15','registered',0);return all(eq(P.cumP[11],9600),eq(P.cumP[11],P.cumF[11]))}));
+ T('見込み: 超える月の文章',()=>withS({wps:[wpT],slips:[]},()=>{
+  const P=projectYear({},[],'2026-06-15','manual',200000);
+  const a=crossText({amount:1100000,incl:false},P),b=crossText({amount:5000000,incl:false},P);
+  return all(eq(a[0],'pace'),eq(a[1].includes('12月'),true),eq(b[0],'ok'))}));
+ T('グラフ: 描画できる',()=>withS({wps:[wpT],slips:[]},()=>{
+  const P=projectYear({},[],'2026-06-15','manual',200000),s=chartSvg(P,[{amount:1100000},{amount:1600000}]);
+  return eq(s.includes('<svg')&&s.includes('110万円')&&s.includes('160万円'),true)}));
+ T('読み込み検査: 明細の不正値を除く',()=>{
+  const j=sanitize({v:1,wps:[{id:'a',name:'x',wages:[]}],shifts:[],slips:[
+   {id:'1',wpId:'a',pay:'2026-01-25',gross:10000,commute:99999},{id:'2',wpId:'a',pay:'bad',gross:1},
+   {id:'3',wpId:'zz',pay:'2026-01-25',gross:1},{id:'4',wpId:'a',pay:'2026-02-25',gross:-5}]});
+  return all(eq(j.slips.length,1),eq(j.slips[0].commute,10000))});
  TA('引継ぎコード: 作って戻すと同じ内容',async()=>{
   const o={v:1,wps:[{id:'a',name:'日本語の店'}],shifts:[],n:[1,2,3]};
   const back=await decodeBackup(await encodeBackup(o));return eq(JSON.stringify(back),JSON.stringify(o))});
@@ -788,13 +1032,20 @@ function act(a,d){
   case'saveShift':saveShift();return;
   case'gcal':{readForm();const err=formError(UI.form);if(err){alert(err);return}window.open(gcalUrl(norm(UI.form)),'_blank','noopener');break}
   case'delShift':if(confirm('このシフトを削除しますか?')){S.shifts=S.shifts.filter(s=>s.id!==UI.form.id);save();UI.form=null}break;
-  case'cancelForm':UI.form=null;UI.wpForm=null;break;
+  case'cancelForm':UI.form=null;UI.wpForm=null;UI.slip=null;break;
   case'newWp':UI.wpForm={...newWp(),isNew:true};UI.tab='set';scrollTo(0,0);break;
   case'editWp':{const w=wpOf(d.id);if(!w)return;UI.wpForm={...JSON.parse(JSON.stringify(w)),isNew:false};scrollTo(0,0);break}
   case'addWage':readWp();UI.wpForm.wages.push({from:todayStr(),yen:''});break;
   case'delWage':readWp();UI.wpForm.wages.splice(+d.i,1);break;
   case'saveWp':saveWp();return;
-  case'delWp':if(confirm('この勤務先と、そのシフトをすべて削除しますか?')){const id=UI.wpForm.id;S.wps=S.wps.filter(w=>w.id!==id);S.shifts=S.shifts.filter(s=>s.wpId!==id);save();UI.wpForm=null}break;
+  case'delWp':if(confirm('この勤務先と、そのシフト・給与明細をすべて削除しますか?')){const id=UI.wpForm.id;S.wps=S.wps.filter(w=>w.id!==id);S.shifts=S.shifts.filter(s=>s.wpId!==id);S.slips=S.slips.filter(s=>s.wpId!==id);save();UI.wpForm=null}break;
+  case'newSlip':{
+   if(!S.wps.length){alert('先に勤務先を登録してください');break}
+   const wid=(d.wp&&wpOf(d.wp))?d.wp:(wpOf(S.last)?S.last:S.wps[0].id);
+   UI.slip=newSlipForm(wid,d.pay||suggestPay(wid,calcAll(S.shifts)));scrollTo(0,0);break}
+  case'editSlip':{const x=S.slips.find(v=>v.id===d.id);if(!x)return;UI.slip={...x,isNew:false,prem:x.prem==null?'':x.prem,net:x.net==null?'':x.net};scrollTo(0,0);break}
+  case'saveSlip':saveSlip();return;
+  case'delSlip':if(confirm('この給与明細を削除しますか?')){S.slips=S.slips.filter(s=>s.id!==UI.slip.id);save();UI.slip=null}break;
   case'addWall':S.walls.push({id:uid(),name:'新しい壁',amount:1000000,basis:'cal',commute:false,incl:false,on:true,cat:'その他',note:'',scope:'',noPrem:false,ver:''});save();break;
   case'delWall':S.walls.splice(+d.i,1);save();break;
   case'resetWalls':if(confirm('壁の設定を初期値に戻しますか?(追加した壁も消えます)')){S.walls=DEFAULT_WALLS();save()}break;
@@ -814,17 +1065,20 @@ function act(a,d){
   case'test':runTests().then(r=>{UI.test=r;render()});return;
   case'wipe':if(confirm('すべてのデータを削除します。元に戻せません。バックアップは保存しましたか?')&&confirm('本当に削除しますか?')){
    localStorage.removeItem(KEY);localStorage.removeItem(KEY+'-prev');S=load();
-   UI={tab:'home',month:todayStr().slice(0,7),view:'cal',day:'',form:null,wpForm:null,test:null,code:''}}break;
+   UI={tab:'home',month:todayStr().slice(0,7),view:'cal',day:'',form:null,wpForm:null,slip:null,test:null,code:''}}break;
  }
  render();
 }
 document.addEventListener('click',e=>{const t=e.target.closest('[data-a]');if(t)act(t.dataset.a,t.dataset)});
 document.addEventListener('input',e=>{
  if(UI.form&&e.target.closest('#f')){readForm();const el=$('#est');if(el)el.innerHTML=estHtml()}
+ else if(UI.slip&&e.target.closest('#sf')){readSlip();const el=$('#cmp');if(el)el.innerHTML=cmpHtml()}
 });
 document.addEventListener('change',e=>{
  const t=e.target;
  if(t.id==='imp'){importFile(t.files[0]);t.value='';return}
+ if(t.id==='pm'){S.proj.mode=t.value;save(true);render();return}
+ if(t.id==='pmv'){S.proj.manual=Math.max(0,Math.round(Number(t.value)||0));save(true);render();return}
  if(t.closest('#wl')){
   document.querySelectorAll('#wl .wr').forEach((r,i)=>{
    const w=S.walls[i];if(!w)return;const g=n=>r.querySelector('[name='+n+']');
@@ -833,7 +1087,10 @@ document.addEventListener('change',e=>{
    w.scope=g('scope').checked?'wp':'';w.incl=g('incl').checked;w.ver=g('ver').checked?(w.ver||todayStr()):'';w.note=g('note').value.slice(0,600)});
   save();return;
  }
- if(t.hasAttribute('data-rerender')&&UI.form){readForm();render()}
+ if(t.hasAttribute('data-rerender')){
+  if(UI.form){readForm();render()}
+  else if(UI.slip){readSlip();render()}
+ }
 });
 if(navigator.storage&&navigator.storage.persist)navigator.storage.persist().then(r=>{PERSIST=r},()=>{});
 render();
